@@ -2,16 +2,15 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 import json
 import os
-import random
 
 app = FastAPI()
 
 # ==============================
-# ✅ CORS
+# ✅ CORS (allow frontend calls)
 # ==============================
 app.add_middleware(
     CORSMiddleware,
@@ -22,7 +21,7 @@ app.add_middleware(
 )
 
 # ==============================
-# 🪵 LOGGING
+# 🪵 LOGGING CONFIG
 # ==============================
 logging.basicConfig(
     level=logging.INFO,
@@ -30,92 +29,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MCP_SERVER_V2")
 
-# ==============================
-# 🔒 CONCURRENCY & CACHE
-# ==============================
-# Limit concurrent outgoing HTTP calls so we don't overwhelm APIs
-http_semaphore = asyncio.Semaphore(6)
-
-# Simple in-memory cache for coordinates: {city_lower: (result, timestamp)}
-_coord_cache = {}
-COORD_CACHE_TTL = timedelta(hours=6)
-
-
-def get_cached_coord(city):
-    key = city.lower().strip()
-    entry = _coord_cache.get(key)
-    if not entry:
-        return None
-    result, ts = entry
-    if datetime.utcnow() - ts > COORD_CACHE_TTL:
-        del _coord_cache[key]
-        return None
-    return result
-
-
-def set_cached_coord(city, result):
-    _coord_cache[city.lower().strip()] = (result, datetime.utcnow())
-
-
 # Shared async client
 client = httpx.AsyncClient(timeout=10)
 
 
 # ==============================
-# 🔧 SAFE ASYNC REQUEST HELPERS (with retries)
+# 🔧 SAFE ASYNC REQUEST HELPERS
 # ==============================
 
-async def safe_get_json(url, method="GET", json_body=None, timeout=10, retries=2):
-    """Fetch JSON with retries and exponential backoff."""
-    for attempt in range(retries + 1):
-        logger.info(f"➡️ {method} JSON (attempt {attempt + 1}/{retries + 1}): {url}")
-        try:
-            async with http_semaphore:
-                if method == "POST":
-                    res = await client.post(url, json=json_body, timeout=timeout)
-                else:
-                    res = await client.get(url, timeout=timeout)
-
-            logger.info(f"⬅️ Status: {res.status_code}")
-            if res.status_code != 200:
-                logger.error(f"❌ Bad status: {res.status_code}")
-                if attempt < retries:
-                    await asyncio.sleep(1.5 * (2 ** attempt) + random.uniform(0, 0.5))
-                    continue
-                return None
-
-            text = res.text.strip()
-            if not text:
-                logger.error("❌ Empty response")
-                return None
-            return res.json()
-
-        except httpx.TimeoutException:
-            logger.error(f"⏳ Timeout on attempt {attempt + 1}")
-            if attempt < retries:
-                await asyncio.sleep(1.5 * (2 ** attempt) + random.uniform(0, 0.5))
-                continue
+async def safe_get_json(url, method="GET", json_body=None, timeout=10):
+    logger.info(f"➡️ {method} JSON: {url}")
+    try:
+        if method == "POST":
+            res = await client.post(url, json=json_body, timeout=timeout)
+        else:
+            res = await client.get(url, timeout=timeout)
+        logger.info(f"⬅️ Status: {res.status_code}")
+        if res.status_code != 200:
+            logger.error(f"❌ Bad status: {res.status_code}")
             return None
-        except Exception as e:
-            logger.exception(f"❌ JSON Error: {e}")
-            if attempt < retries:
-                await asyncio.sleep(1.0)
-                continue
+        if not res.text.strip():
+            logger.error("❌ Empty response")
             return None
-    return None
+        return res.json()
+    except httpx.ReadTimeout:
+        logger.error("⏳ Timeout")
+        return None
+    except Exception as e:
+        logger.exception(f"❌ JSON Error: {e}")
+        return None
 
 
 async def safe_get_text(url, timeout=10):
     logger.info(f"➡️ GET TEXT: {url}")
     try:
-        async with http_semaphore:
-            res = await client.get(url, timeout=timeout)
+        res = await client.get(url, timeout=timeout)
         logger.info(f"⬅️ Status: {res.status_code}")
         if res.status_code != 200:
             logger.error(f"❌ Text status: {res.status_code}")
             return None
         return res.text
-    except httpx.TimeoutException:
+    except httpx.ReadTimeout:
         logger.error("⏳ Text timeout")
         return None
     except Exception as e:
@@ -128,6 +82,7 @@ async def safe_get_text(url, timeout=10):
 # ==============================
 
 async def get_coordinates_openmeteo(city):
+    """Primary: Open-Meteo Geocoding"""
     url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1"
     res = await safe_get_json(url)
     if not res or "results" not in res or not res["results"]:
@@ -143,27 +98,22 @@ async def get_coordinates_openmeteo(city):
 
 
 async def get_coordinates_nominatim(city):
-    """Fallback: OpenStreetMap Nominatim (rate-limited, respect it)."""
+    """Fallback 1: OpenStreetMap Nominatim"""
     url = f"https://nominatim.openstreetmap.org/search?q={city}&format=json&limit=1"
     headers = {"User-Agent": "GeoBot-MCP/2.0"}
     try:
-        async with http_semaphore:
-            res = await client.get(url, headers=headers, timeout=10)
+        res = await client.get(url, headers=headers, timeout=10)
         if res.status_code != 200:
             return None
         data = res.json()
         if not data or len(data) == 0:
             return None
         place = data[0]
-        lat = place.get("lat")
-        lon = place.get("lon")
-        if lat is None or lon is None:
-            return None
         return {
             "city": place.get("display_name", "").split(",")[0],
             "country": place.get("display_name", "").split(",")[-1].strip(),
-            "latitude": float(lat),
-            "longitude": float(lon),
+            "latitude": float(place.get("lat")),
+            "longitude": float(place.get("lon")),
             "timezone": "UTC"
         }
     except Exception as e:
@@ -172,13 +122,8 @@ async def get_coordinates_nominatim(city):
 
 
 async def get_coordinates(city):
+    """Try multiple coordinate sources with fallback"""
     logger.info(f"🌍 Fetching coordinates for: {city}")
-
-    cached = get_cached_coord(city)
-    if cached:
-        logger.info(f"✅ Cache hit for {city}")
-        return cached
-
     sources = [
         ("Open-Meteo", get_coordinates_openmeteo),
         ("Nominatim", get_coordinates_nominatim),
@@ -189,7 +134,6 @@ async def get_coordinates(city):
             result = await fn(city)
             if result and result.get("latitude") and result.get("longitude"):
                 logger.info(f"✅ {name} success: {result['city']}, {result['country']}")
-                set_cached_coord(city, result)
                 return result
         except Exception as e:
             logger.warning(f"❌ {name} failed: {e}")
@@ -198,10 +142,11 @@ async def get_coordinates(city):
 
 
 # ==============================
-# 💧 HUMIDITY
+# 💧 HUMIDITY — MULTIPLE SOURCES
 # ==============================
 
 async def get_humidity_openmeteo(lat, lon):
+    """Primary: Open-Meteo Humidity"""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=relative_humidity_2m"
     res = await safe_get_json(url)
     if not res or "current" not in res:
@@ -214,6 +159,7 @@ async def get_humidity_openmeteo(lat, lon):
 
 
 async def get_humidity_7timer(lat, lon):
+    """Fallback 1: 7Timer Humidity"""
     url = f"https://www.7timer.info/bin/api.pl?lon={lon}&lat={lat}&product=civil&output=json"
     try:
         res = await safe_get_json(url, timeout=8)
@@ -239,6 +185,7 @@ async def get_humidity_7timer(lat, lon):
 
 
 async def get_humidity(lat, lon):
+    """Try multiple humidity sources with fallback"""
     logger.info(f"💧 Fetching humidity for: {lat}, {lon}")
     sources = [
         ("Open-Meteo Humidity", get_humidity_openmeteo),
@@ -258,10 +205,11 @@ async def get_humidity(lat, lon):
 
 
 # ==============================
-# ☀️ UV INDEX
+# ☀️ UV INDEX — MULTIPLE SOURCES
 # ==============================
 
 async def get_uv_openmeteo(lat, lon):
+    """Primary: Open-Meteo UV Index"""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=uv_index"
     res = await safe_get_json(url)
     if not res or "current" not in res:
@@ -287,6 +235,7 @@ async def get_uv_openmeteo(lat, lon):
 
 
 async def get_uv_openweather(lat, lon):
+    """Fallback 1: OpenWeatherMap UV (requires free API key)"""
     api_key = os.environ.get("OPENWEATHER_API_KEY")
     if not api_key:
         return None
@@ -319,6 +268,7 @@ async def get_uv_openweather(lat, lon):
 
 
 async def get_uv(lat, lon):
+    """Try multiple UV sources with fallback"""
     logger.info(f"☀️ Fetching UV index for: {lat}, {lon}")
     sources = [
         ("Open-Meteo UV", get_uv_openmeteo),
@@ -338,10 +288,11 @@ async def get_uv(lat, lon):
 
 
 # ==============================
-# 🌙 MOON PHASE
+# 🌙 MOON PHASE — MULTIPLE SOURCES
 # ==============================
 
 async def get_moon_phase_freeastro():
+    """Primary: FreeAstroAPI Moon Phase"""
     url = "https://api.freeastroapi.com/api/v1/moon/phase"
     try:
         res = await safe_get_json(url, timeout=8)
@@ -350,8 +301,8 @@ async def get_moon_phase_freeastro():
         phase = res["phase"]
         return {
             "phase_name": phase.get("name"),
-            "illumination_percent": round(phase.get("illumination", 0) * 100, 1) if phase.get("illumination") is not None else None,
-            "age_days": round(phase.get("age_days", 0), 1) if phase.get("age_days") is not None else None,
+            "illumination_percent": round(phase.get("illumination", 0) * 100, 1) if phase.get("illumination") else None,
+            "age_days": round(phase.get("age_days", 0), 1) if phase.get("age_days") else None,
             "is_waxing": phase.get("is_waxing"),
             "source": "freeastro"
         }
@@ -361,6 +312,7 @@ async def get_moon_phase_freeastro():
 
 
 async def get_moon_phase_phaseoftoday():
+    """Fallback 1: PhaseOfTheMoonToday"""
     url = "https://api.phaseofthemoontoday.com/v1/current"
     try:
         res = await safe_get_json(url, timeout=8)
@@ -380,6 +332,7 @@ async def get_moon_phase_phaseoftoday():
 
 
 async def get_moon_phase():
+    """Try multiple moon phase sources with fallback"""
     logger.info("🌙 Fetching moon phase...")
     sources = [
         ("FreeAstro Moon", get_moon_phase_freeastro),
@@ -399,10 +352,11 @@ async def get_moon_phase():
 
 
 # ==============================
-# 🌡️ SOLAR RADIATION
+# 🌡️ SOLAR RADIATION — MULTIPLE SOURCES
 # ==============================
 
 async def get_solar_radiation_openmeteo(lat, lon):
+    """Primary: Open-Meteo Solar Radiation"""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=shortwave_radiation"
     res = await safe_get_json(url)
     if not res or "current" not in res:
@@ -418,6 +372,7 @@ async def get_solar_radiation_openmeteo(lat, lon):
 
 
 async def get_solar_radiation(lat, lon):
+    """Try solar radiation sources with fallback"""
     logger.info(f"🌡️ Fetching solar radiation for: {lat}, {lon}")
     sources = [
         ("Open-Meteo Solar", get_solar_radiation_openmeteo),
@@ -436,10 +391,11 @@ async def get_solar_radiation(lat, lon):
 
 
 # ==============================
-# 🌫️ PRESSURE
+# 🌫️ PRESSURE — MULTIPLE SOURCES
 # ==============================
 
 async def get_pressure_openmeteo(lat, lon):
+    """Primary: Open-Meteo Pressure"""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=surface_pressure"
     res = await safe_get_json(url)
     if not res or "current" not in res:
@@ -455,6 +411,7 @@ async def get_pressure_openmeteo(lat, lon):
 
 
 async def get_pressure(lat, lon):
+    """Try pressure sources with fallback"""
     logger.info(f"🌫️ Fetching pressure for: {lat}, {lon}")
     sources = [
         ("Open-Meteo Pressure", get_pressure_openmeteo),
@@ -473,10 +430,11 @@ async def get_pressure(lat, lon):
 
 
 # ==============================
-# 👁️ VISIBILITY
+# 👁️ VISIBILITY — MULTIPLE SOURCES
 # ==============================
 
 async def get_visibility_openmeteo(lat, lon):
+    """Primary: Open-Meteo Visibility"""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=visibility"
     res = await safe_get_json(url)
     if not res or "current" not in res:
@@ -493,6 +451,7 @@ async def get_visibility_openmeteo(lat, lon):
 
 
 async def get_visibility(lat, lon):
+    """Try visibility sources with fallback"""
     logger.info(f"👁️ Fetching visibility for: {lat}, {lon}")
     sources = [
         ("Open-Meteo Visibility", get_visibility_openmeteo),
@@ -511,10 +470,11 @@ async def get_visibility(lat, lon):
 
 
 # ==============================
-# 💨 DEW POINT
+# 💨 DEW POINT — MULTIPLE SOURCES
 # ==============================
 
 async def get_dewpoint_openmeteo(lat, lon):
+    """Primary: Open-Meteo Dew Point"""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=dew_point_2m"
     res = await safe_get_json(url)
     if not res or "current" not in res:
@@ -530,6 +490,7 @@ async def get_dewpoint_openmeteo(lat, lon):
 
 
 async def get_dewpoint(lat, lon):
+    """Try dew point sources with fallback"""
     logger.info(f"💨 Fetching dew point for: {lat}, {lon}")
     sources = [
         ("Open-Meteo Dew Point", get_dewpoint_openmeteo),
@@ -548,10 +509,11 @@ async def get_dewpoint(lat, lon):
 
 
 # ==============================
-# ☁️ CLOUD COVER
+# ☁️ CLOUD COVER — MULTIPLE SOURCES
 # ==============================
 
 async def get_cloudcover_openmeteo(lat, lon):
+    """Primary: Open-Meteo Cloud Cover"""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=cloud_cover"
     res = await safe_get_json(url)
     if not res or "current" not in res:
@@ -567,6 +529,7 @@ async def get_cloudcover_openmeteo(lat, lon):
 
 
 async def get_cloudcover(lat, lon):
+    """Try cloud cover sources with fallback"""
     logger.info(f"☁️ Fetching cloud cover for: {lat}, {lon}")
     sources = [
         ("Open-Meteo Cloud Cover", get_cloudcover_openmeteo),
@@ -585,12 +548,11 @@ async def get_cloudcover(lat, lon):
 
 
 # ==============================
-# ♻️ KEEP-ALIVE
+# ♻️ KEEP-ALIVE (Self-ping to prevent Render sleep)
 # ==============================
 
 SELF_URL = os.environ.get("SELF_URL", "https://your-new-server.onrender.com/tool")
 KEEP_ALIVE_INTERVAL = 540  # 9 minutes
-
 
 async def keep_alive_loop():
     logger.info(f"♻️ Keep-alive started — pinging {SELF_URL} every {KEEP_ALIVE_INTERVAL // 60} minutes")
@@ -619,13 +581,11 @@ async def startup_event():
 
 
 # ==============================
-# 🧠 TOOL HANDLER (FIXED)
+# 🧠 TOOL HANDLER
 # ==============================
 
 @app.post("/tool")
 async def tool_handler(request: Request):
-    meta = {"success": [], "missing": [], "failed": []}
-
     try:
         payload = await request.json()
         logger.info("🔥 MCP SERVER V2 HIT")
@@ -663,60 +623,56 @@ async def tool_handler(request: Request):
         lat = coord["latitude"]
         lon = coord["longitude"]
 
-        # 🚀 PARALLEL EXECUTION — with return_exceptions=True so one crash doesn't kill all
-        tasks = [
-            get_humidity(lat, lon),
-            get_uv(lat, lon),
-            get_moon_phase(),
-            get_solar_radiation(lat, lon),
-            get_pressure(lat, lon),
-            get_visibility(lat, lon),
-            get_dewpoint(lat, lon),
-            get_cloudcover(lat, lon),
-        ]
+        # 🚀 PARALLEL EXECUTION (KEY BOOST)
+        humidity_task = get_humidity(lat, lon)
+        uv_task = get_uv(lat, lon)
+        moon_task = get_moon_phase()
+        solar_task = get_solar_radiation(lat, lon)
+        pressure_task = get_pressure(lat, lon)
+        visibility_task = get_visibility(lat, lon)
+        dewpoint_task = get_dewpoint(lat, lon)
+        cloudcover_task = get_cloudcover(lat, lon)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        humidity, uv, moon, solar, pressure, visibility, dewpoint, cloudcover = results
+        humidity, uv, moon, solar, pressure, visibility, dewpoint, cloudcover = await asyncio.gather(
+            humidity_task,
+            uv_task,
+            moon_task,
+            solar_task,
+            pressure_task,
+            visibility_task,
+            dewpoint_task,
+            cloudcover_task
+        )
 
         result = {
             "source": "MCP_SERVER_V2_NEW_FEATURES",
             "city": coord["city"],
             "country": coord["country"],
             "latitude": lat,
-            "longitude": lon,
-            "meta": meta
+            "longitude": lon
         }
 
-        # Safely attach each result; log exceptions separately
-        data_map = {
-            "humidity": humidity,
-            "uv_index": uv,
-            "moon_phase": moon,
-            "solar_radiation": solar,
-            "pressure": pressure,
-            "visibility": visibility,
-            "dew_point": dewpoint,
-            "cloud_cover": cloudcover,
-        }
-
-        for key, value in data_map.items():
-            if isinstance(value, Exception):
-                logger.error(f"💥 {key} raised an exception: {value}")
-                meta["failed"].append(key)
-            elif value:
-                result[key] = value
-                meta["success"].append(key)
-            else:
-                meta["missing"].append(key)
+        if humidity:
+            result["humidity"] = humidity
+        if uv:
+            result["uv_index"] = uv
+        if moon:
+            result["moon_phase"] = moon
+        if solar:
+            result["solar_radiation"] = solar
+        if pressure:
+            result["pressure"] = pressure
+        if visibility:
+            result["visibility"] = visibility
+        if dewpoint:
+            result["dew_point"] = dewpoint
+        if cloudcover:
+            result["cloud_cover"] = cloudcover
 
         logger.info("✅ Final Response:")
         logger.info(json.dumps(result, indent=2))
         return result
 
-    except asyncio.CancelledError:
-        logger.warning("⚠️ Request was cancelled")
-        raise
     except Exception as e:
         logger.exception(f"💥 CRITICAL ERROR: {e}")
-        return {"error": "Internal server error", "detail": str(e)}
+        return {"error": "Internal server error"}
